@@ -11,6 +11,8 @@ import json
 import time
 import requests
 from datetime import datetime
+from zoneinfo import ZoneInfo
+from urllib.parse import urlparse
 from typing import Optional
 
 try:
@@ -270,6 +272,24 @@ class NewAPICheckin:
                 traceback.print_exc()
             return None
 
+    def _xinyuan_checked_in_today(self) -> bool:
+        """Confirm check-in using the site's read-only calendar API."""
+        if urlparse(self.base_url).hostname != 'xinyuanai666.com':
+            return False
+        today = datetime.now(ZoneInfo('Asia/Shanghai')).strftime('%Y-%m-%d')
+        history = self.get_checkin_history(today[:7])
+        if not isinstance(history, dict):
+            return False
+        stats = history.get('stats')
+        if not isinstance(stats, dict):
+            return False
+        records = stats.get('records') or history.get('records') or []
+        if isinstance(records, list):
+            for entry in records:
+                if isinstance(entry, dict) and str(entry.get('checkin_date', ''))[:10] == today:
+                    return True
+        return stats.get('checked_in_today') is True
+
     def checkin(self) -> dict:
         """
         执行签到
@@ -290,6 +310,12 @@ class NewAPICheckin:
         }
 
         try:
+            if self._xinyuan_checked_in_today():
+                result['success'] = True
+                result['message'] = '今天已签到（已从网站签到记录确认）'
+                result['checkin_date'] = datetime.now(ZoneInfo('Asia/Shanghai')).strftime('%Y-%m-%d')
+                return result
+
             resp = self.session.post(f'{self.base_url}/api/user/checkin', timeout=30)
 
             if resp.status_code == 401:
@@ -350,6 +376,13 @@ class NewAPICheckin:
                     if already_checked_in:
                         result['success'] = True
                         result['message'] = message
+                    elif urlparse(self.base_url).hostname == 'xinyuanai666.com' and any(
+                        word in message.lower() for word in ('人机验证', '滑块', 'captcha')
+                    ):
+                        result['message'] = (
+                            '需要人工完成滑块验证：请登录 https://xinyuanai666.com/console '
+                            '进行签到，然后重新运行本工作流确认。'
+                        )
                     elif 'pow' in message.lower():
                         # 站点开启 PoW 工作量证明，本地直接解算后重签
                         print(f'[PoW] 站点要求工作量证明: {message}')
@@ -740,6 +773,9 @@ def load_env_file():
 def build_advice(message: str) -> str:
     """根据失败消息生成排查建议（随通知推送）"""
     m = message.lower()
+    if '滑块' in m or '人机验证' in m or 'captcha' in m:
+        return ('请登录 https://xinyuanai666.com/console 手动完成滑块验证及签到；'
+                '完成后重新运行 GitHub Actions，脚本将读取日历确认。')
     if 'turnstile' in m:
         return ('该站开启 Turnstile 人机验证，已自动点击求解；若反复失败，'
                 '建议本地运行一次 python checkin.py')
@@ -976,6 +1012,20 @@ def main():
         send_serverchan_notification(checkin_results, execution_time)
     elif os.environ.get('SERVERCHAN_SENDKEY'):
         print('[警告] 已配置 SERVERCHAN_SENDKEY 但无法导入通知模块')
+
+    summary_path = os.environ.get('GITHUB_STEP_SUMMARY')
+    if summary_path:
+        try:
+            with open(summary_path, 'a', encoding='utf-8') as summary:
+                summary.write('## NewAPI 签到结果\n\n')
+                for item in checkin_results:
+                    label = '已签到' if item.get('success') else '需要处理'
+                    name = str(item.get('name', '账号')).replace('\n', ' ')
+                    msg = str(item.get('message', '')).replace('\n', ' ')
+                    summary.write(f'- **{label}** · {name}：{msg}\n')
+                summary.write('\n人工签到入口：https://xinyuanai666.com/console\n')
+        except OSError as exc:
+            print(f'[摘要] 写入失败: {type(exc).__name__}')
 
     # 回写 .env（仅限从 .env 加载且 session 有更新的本地运行）
     if from_env_file and session_updated and not os.environ.get('GITHUB_ACTIONS'):
