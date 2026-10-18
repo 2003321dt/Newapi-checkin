@@ -1,0 +1,57 @@
+name: Verify Xinyuan check-in status
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/verify-xinyuan.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - name: Confirm today's Xinyuan sign-in (read only)
+        env:
+          NEWAPI_ACCOUNTS: ${{ secrets.NEWAPI_ACCOUNTS }}
+        run: |
+          python - <<'PY'
+          import os
+          import sys
+          from urllib.parse import urlparse
+          from checkin import NewAPICheckin, parse_accounts
+
+          accounts = parse_accounts(os.environ.get('NEWAPI_ACCOUNTS', ''))
+          selected = [a for a in accounts if urlparse(a['url']).hostname == 'xinyuanai666.com']
+          if not selected:
+              print('No configured Xinyuan account was found in NEWAPI_ACCOUNTS')
+              sys.exit(1)
+          passed = 0
+          for account in selected:
+              client = NewAPICheckin(
+                  account['url'], account.get('session', ''), account.get('user_id'),
+                  account.get('cf_clearance'), account.get('login_username'),
+                  account.get('login_password'), account.get('access_token')
+              )
+              if not client.get_user_info():
+                  print('Xinyuan: account authentication failed')
+                  continue
+              if client._xinyuan_checked_in_today():
+                  print('Xinyuan: confirmed checked in today via calendar API')
+                  passed += 1
+              else:
+                  print('Xinyuan: not confirmed; manual slider check-in may be required')
+          summary = f'Confirmed {passed}/{len(selected)} Xinyuan accounts checked in today.'
+          print(summary)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as f:
+              f.write('## Xinyuan read-only verification\n\n' + summary + '\n')
+          sys.exit(0 if passed == len(selected) else 1)
+          PY
